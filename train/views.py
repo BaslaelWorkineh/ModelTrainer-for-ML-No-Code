@@ -10,12 +10,15 @@ from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier  # Example model
 from sklearn.metrics import accuracy_score
 from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import LabelEncoder, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import StandardScaler
 import numpy as np
+import joblib
+import os
+from django.http import FileResponse
 
 class FileUploadView(APIView):
     parser_classes = (MultiPartParser,)
@@ -93,81 +96,82 @@ class TrainModelAPIView(APIView):
     parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request, *args, **kwargs):
-        # Retrieve the latest uploaded file (CSV) for training
         uploaded_file = UploadedFile.objects.last()
         if not uploaded_file:
             return Response({'error': 'No CSV file found in the database'}, status=400)
 
-        # Fetch all available parameters
         parameters = Parameter.objects.all()
         if not parameters.exists():
             return Response({'error': 'No parameters found in the database'}, status=400)
 
         try:
-            # Load the uploaded file's data
-            df = pd.DataFrame(uploaded_file.data)  # or pd.read_csv(uploaded_file.file) for CSV files
-        except Exception as e:
-            return Response({'error': f'Error loading CSV data: {str(e)}'}, status=500)
+            df = pd.DataFrame(uploaded_file.data)
 
-        # Prepare the data: assuming the last column is the target/label column
-        X, y = self.prepare_data(df)  # Corrected call
+            X, y = self.prepare_data(df)  # Prepare the data (features and target)
+            params = {param.name: param.value for param in parameters}
+            
+            model_selection = ModelSelection.objects.last()
+            if not model_selection:
+                return Response({'error': 'No model selected in the database'}, status=400)
 
-        # Convert the parameters to a dictionary
-        params = {param.name: param.value for param in parameters}
+            model_name = model_selection.selected_model  # Get the model name from the database
 
-        # Dynamically determine the model name from the request
-        model_name = request.data.get('model_name', 'linear_regression')  # You can adjust the logic here
-
-        try:
-            # Get the selected model
-            model = self.get_model(model_name, params)
+            # Pass X and y to get_model
+            model = self.get_model(model_name, params, y)  # Pass y as argument here
             model.fit(X, y)
 
-            # Make predictions and calculate accuracy (or other relevant metrics)
             y_pred = model.predict(X)
-            
-            if model_name in ['linear_regression']:
-                loss = ((y - y_pred) ** 2).mean()  # Mean Squared Error for regression models
-                accuracy = 1 - loss  # For reporting purposes
-            else:
-                accuracy = accuracy_score(y, y_pred)  # For classification models
-                loss = 1 - accuracy  # Placeholder for loss calculation
+            accuracy = accuracy_score(y, y_pred)
+            loss = 1 - accuracy
 
             # Store training history
             self.store_training_history(accuracy, loss)
 
+            # Save the trained model to a file
+            model_filename = 'trained_model.pkl'
+            model_filepath = os.path.join('models', model_filename)  # Define the path
+            os.makedirs(os.path.dirname(model_filepath), exist_ok=True)  # Create directory if not exists
+            joblib.dump(model, model_filepath)  # Save model as a .pkl file
+
             return Response({
-                'accuracy': accuracy,
-                'loss': loss,
-                'message': 'Training completed successfully.'
+                'metrics': {
+                    'accuracy': accuracy,
+                    'loss': loss,
+                    'validationAccuracy': accuracy,  # Placeholder if no validation accuracy is computed
+                    'validationLoss': loss           # Placeholder if no validation loss is computed
+                },
+                'progress': 100,  # Assuming progress is complete for now
+                'message': 'Training completed successfully.',
+                'model_url': model_filepath  # Provide the model URL for downloading
             })
+
 
         except Exception as e:
             return Response({'error': str(e)}, status=500)
 
-
-    def get_model(self, model_name, params):
+    def get_model(self, model_name, params, y):
         """
-        Select and configure the model based on the provided name and parameters.
+        Select and configure the model based on the provided name and target data (y).
+        It distinguishes between classification and regression.
         """
-        if model_name == 'linear_regression':
-            # Parameters for Linear Regression (you can add more if needed)
-            return LinearRegression()
+        # Check if the target (y) is continuous or categorical
+        if y.nunique() > 2:  # Continuous target variable (regression task)
+            if model_name == 'Linear Regression':
+                return LinearRegression()
+            elif model_name == 'Decision Tree':
+                return DecisionTreeRegressor()  # Use regression model
+            else:
+                raise ValueError(f"Model {model_name} is not suitable for regression.")
         
-        elif model_name == 'logistic_regression':
-            # Parameters for Logistic Regression (you can add more if needed)
-            return LogisticRegression(max_iter=1000)
-
-        elif model_name == 'decision_tree':
-            # Parameters for Decision Tree (you can add more if needed)
-            return DecisionTreeClassifier()
-
-        elif model_name == 'neural_network':
-            # Parameters for Neural Network (you can add more if needed)
-            return MLPClassifier(hidden_layer_sizes=(100,), max_iter=2000)
-
-        else:
-            raise ValueError(f"Model {model_name} is not supported")
+        else:  # Binary or multi-class classification
+            if model_name == 'Logistic Regression':
+                return LogisticRegression(max_iter=1000)
+            elif model_name == 'Decision Tree':
+                return DecisionTreeClassifier()  # Use classification model
+            elif model_name == 'Neural Network':
+                return MLPClassifier(hidden_layer_sizes=(100,), max_iter=2000)
+            else:
+                raise ValueError(f"Model {model_name} is not suitable for classification.")
 
     def prepare_data(self, df):
         """
@@ -230,6 +234,12 @@ class TrainModelAPIView(APIView):
         # Handle missing values in 'y'
         y = y.fillna(y.mean())  # Fill NaNs with the mean (you can modify this if needed)
 
+        # Check if y is binary or continuous
+        if len(y.unique()) > 2:  # Continuous data for regression
+            print("Regression problem detected.")
+        else:  # Binary or categorical for classification
+            print("Classification problem detected.")
+
         return X_scaled, y
 
     
@@ -255,3 +265,17 @@ class TrainModelAPIView(APIView):
             )
         except Exception as e:
             raise ValueError(f"Error storing training history: {str(e)}")
+
+
+class DownloadModelAPIView(APIView):
+    def get(self, request, *args, **kwargs):
+        model_filename = 'trained_model.pkl'  # Use the same filename as in the training view
+        model_filepath = os.path.join('models', model_filename)
+
+        # Check if the model file exists
+        if os.path.exists(model_filepath):
+            response = FileResponse(open(model_filepath, 'rb'), content_type='application/octet-stream')
+            response['Content-Disposition'] = f'attachment; filename={model_filename}'
+            return response
+        else:
+            return Response({'error': 'Model file not found.'}, status=404)
