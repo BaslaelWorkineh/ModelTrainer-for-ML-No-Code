@@ -15,11 +15,11 @@ source myenv/bin/activate
 pip install -r requirements.txt
 
 # Apply migrations to set up the database
-python manage.py migrate
+python3 manage.py migrate
 
 # Create a superuser for Django admin if required
 # Uncomment the following lines if needed
 # python manage.py createsuperuser
 
 # Run the server
-python manage.py runserver
+python3 manage.py runserver
